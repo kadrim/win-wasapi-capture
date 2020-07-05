@@ -1,6 +1,7 @@
 #pragma once
 
 #include <obs-module.h>
+#include <mutex>
 #include <string>
 #include <windows.h>
 #include <ks.h>
@@ -27,6 +28,8 @@ private:
 	HANDLE           capture_thread;
 	HANDLE           keepalive_thread;
 	bool             destroying;
+	bool             destroying_capture;
+	std::mutex       update_capture_mutex;
 
 	std::string      title;
 	std::string      class_name;

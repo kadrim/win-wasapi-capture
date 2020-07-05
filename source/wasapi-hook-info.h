@@ -37,6 +37,7 @@ struct audio_packet_header {
 	WAVEFORMATEXTENSIBLE   wfext;
 	uint64_t               timestamp;
 	uint32_t               data_length;
+	bool                   silent;
 };
 
 struct audio_packet {

@@ -105,6 +105,7 @@ static HRESULT STDMETHODCALLTYPE hook_release_buffer(
 	packet_header.frames = frames_written;
 	packet_header.data_length = (uint32_t)data_length;
 	packet_header.timestamp = (uint64_t)time_val;
+	packet_header.silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
 	memcpy(&packet_header.wfext, wfext, sizeof(WAVEFORMATEXTENSIBLE));
 
 	if (pipe != INVALID_HANDLE_VALUE)

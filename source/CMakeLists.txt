@@ -29,10 +29,12 @@ add_library(win-wasapi-capture MODULE
 
 target_link_libraries(win-wasapi-capture
 	libobs
-	psapi)
+	psapi
+	Dwmapi
+)
 
 if(NOT is-standalone-build)
-	install_obs_plugin_with_data(win-wasapi-capture data)
+	install_obs_plugin(win-wasapi-capture)
 endif()
 
 add_subdirectory(wasapi-hook)

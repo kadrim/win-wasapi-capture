@@ -37,27 +37,25 @@ wasapi_capture::wasapi_capture(obs_source_t* source)
 {
 	this->source = source;
 
-	capture_thread = CreateThread(nullptr, 0,
-		(LPTHREAD_START_ROUTINE)wasapi_capture::capture_thread_proc_proxy,
-		this, 0, nullptr);
+	process_id = 0;
+	target_process = INVALID_HANDLE_VALUE;
+
+	destroying_capture = false;
+	capture_thread = NULL;
+
+	destroying = false;
 	keepalive_thread = CreateThread(nullptr, 0,
 		(LPTHREAD_START_ROUTINE)wasapi_capture::keepalive_thread_proc_proxy,
 		this, 0, nullptr);
-
-	process_id = 0;
-	destroying = false;
-	target_process = INVALID_HANDLE_VALUE;
 }
 
 wasapi_capture::~wasapi_capture()
 {
 	destroying = true;
 	WaitForSingleObject(keepalive_thread, INFINITE);
-	WaitForSingleObject(capture_thread, INFINITE);
-	eject();
-	free_pipe();
-	free_shared_memory();
-	free_events();
+
+	std::scoped_lock<std::mutex> lock(update_capture_mutex);
+	exit_capture();
 }
 
 //-----------------------------------------------------------------------------
@@ -94,14 +92,13 @@ speaker_layout wasapi_capture::convert_speaker_layout(WAVEFORMATEXTENSIBLE* wfex
 #define KSAUDIO_SPEAKER_2POINT1 (KSAUDIO_SPEAKER_STEREO|SPEAKER_LOW_FREQUENCY)
 
 	switch (wfext->dwChannelMask) {
-	case KSAUDIO_SPEAKER_QUAD:             return SPEAKERS_QUAD;
+	case KSAUDIO_SPEAKER_MONO:             return SPEAKERS_MONO;
+	case KSAUDIO_SPEAKER_STEREO:           return SPEAKERS_STEREO;
 	case KSAUDIO_SPEAKER_2POINT1:          return SPEAKERS_2POINT1;
+	case KSAUDIO_SPEAKER_QUAD:             return SPEAKERS_4POINT0;
 	case KSAUDIO_SPEAKER_4POINT1:          return SPEAKERS_4POINT1;
-	case KSAUDIO_SPEAKER_SURROUND:         return SPEAKERS_SURROUND;
 	case KSAUDIO_SPEAKER_5POINT1:          return SPEAKERS_5POINT1;
-	case KSAUDIO_SPEAKER_5POINT1_SURROUND: return SPEAKERS_5POINT1_SURROUND;
 	case KSAUDIO_SPEAKER_7POINT1:          return SPEAKERS_7POINT1;
-	case KSAUDIO_SPEAKER_7POINT1_SURROUND: return SPEAKERS_7POINT1_SURROUND;
 	}
 
 	return (speaker_layout)wfext->Format.nChannels;
@@ -151,7 +148,7 @@ bool wasapi_capture::receive_audio_packet()
 		capture_buflen = header.data_length;
 		capture_buffer = (uint8_t*)realloc(capture_buffer, capture_buflen);
 		if (!capture_buffer) {
-			destroying = true;
+			destroying_capture = true;
 			return false; // out of memory
 		}
 	}
@@ -161,6 +158,9 @@ bool wasapi_capture::receive_audio_packet()
 	{
 		return false; // invalid data.
 	}
+
+	if (header.silent)
+		std::memset(capture_buffer, 0, header.data_length);
 
 	obs_source_audio audio = {0};
 	audio.format          = convert_audio_format(&header.wfext);
@@ -180,15 +180,15 @@ void wasapi_capture::capture_thread_proc()
 	capture_buflen = 441 * 8 * 32; // 44.1kHz, 8ch, 32bit, 100ms
 	capture_buffer = (uint8_t*)malloc(capture_buflen);
 
-	while (!destroying) {
+	while (!destroying_capture) {
 		DWORD wait_result = WaitForSingleObject(event_packet_sent, 500);
-		if (wait_result != WAIT_OBJECT_0 || destroying) {
+		if (wait_result != WAIT_OBJECT_0 || destroying_capture) {
 			continue;
 		}
 
 		while (shared_data && 
 				os_atomic_load_long(&shared_data->packets) > 0 && 
-				!destroying) 
+				!destroying_capture) 
 		{
 			bool receive_result = receive_audio_packet();
 			os_atomic_dec_long(&shared_data->packets);
@@ -421,6 +421,12 @@ void wasapi_capture::free_shared_memory()
 
 void wasapi_capture::exit_capture()
 {
+	if (capture_thread) {
+		destroying_capture = true;
+		WaitForSingleObject(capture_thread, INFINITE);
+		capture_thread = NULL;
+	}
+
 	eject();
 	free_pipe();
 	free_events();
@@ -435,10 +441,19 @@ void wasapi_capture::start_capture()
 	init_shared_memory();
 	ResetEvent(event_exit);
 	inject();
+
+	destroying_capture = false;
+	capture_thread =
+		CreateThread(nullptr, 0,
+			     (LPTHREAD_START_ROUTINE)
+				     wasapi_capture::capture_thread_proc_proxy,
+			     this, 0, nullptr);
 }
 
 void wasapi_capture::update_capture()
 {
+	std::scoped_lock<std::mutex> lock(update_capture_mutex);
+
 	// Rehook if target is changed
 	DWORD new_pid = get_target_process_id();
 	DWORD prev_pid = process_id;
