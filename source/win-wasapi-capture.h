@@ -43,6 +43,7 @@ private:
 	HANDLE           event_exit;
 	HANDLE           event_packet_sent;
 	HANDLE           event_keepalive;
+	HANDLE           event_destroy;
 
 public: /* obs_source_info */
 	static const char* get_name(void* data);

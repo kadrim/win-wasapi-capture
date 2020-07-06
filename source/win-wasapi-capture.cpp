@@ -1,7 +1,16 @@
+#define NOMINMAX
+
+#include <algorithm>
 #include <string>
+#include <map>
+#include <vector>
 #include <windows.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
 #include <ks.h>
 #include <ksmedia.h>
+#include <Psapi.h>
+#include <shlwapi.h>
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/threading.h>
@@ -24,9 +33,182 @@ extern "C" {
 
 namespace {
 	const char* plugin_name = "WASAPICapture";
+	const char* setting_target_process = "WASAPICapture.TargetProcess";
+	const char* setting_target_process_desc = "Target Process";
 	const char* setting_target_window = "WASAPICapture.TargetWindow";
-	const char* setting_target_window_desc = "WASAPICapture.TargetWindow.Description";
+	const char* setting_target_window_desc = "Fallback Target Window";
 }
+
+
+template<typename T>
+static void SAFE_RELEASE(T*&ppT)
+{
+	if (ppT) {
+		ppT->Release();
+		ppT = NULL;
+	}
+}
+
+#define CHECK_HR(x)        \
+	if (FAILED(x)) {   \
+		goto done; \
+	}
+
+static HRESULT EnumSessions(IAudioSessionManager2 *pSessionManager, std::vector<DWORD>& pids)
+{
+	if (!pSessionManager) {
+		return E_INVALIDARG;
+	}
+
+	HRESULT hr = S_OK;
+
+	int cbSessionCount = 0;
+
+	IAudioSessionEnumerator *pSessionList = NULL;
+	IAudioSessionControl *pSessionControl = NULL;
+	IAudioSessionControl2 *pSessionControl2 = NULL;
+
+	// Get the current list of sessions.
+	CHECK_HR(hr = pSessionManager->GetSessionEnumerator(&pSessionList));
+
+	// Get the session count.
+	CHECK_HR(hr = pSessionList->GetCount(&cbSessionCount));
+
+	for (int index = 0; index < cbSessionCount; index++) {
+		SAFE_RELEASE(pSessionControl2);
+		SAFE_RELEASE(pSessionControl);
+
+		// Get the <n>th session.
+		CHECK_HR(
+			hr = pSessionList->GetSession(index, &pSessionControl));
+
+		// Get the extended session control interface pointer.
+		CHECK_HR(hr = pSessionControl->QueryInterface(
+				 __uuidof(IAudioSessionControl2),
+				 (void **)&pSessionControl2));
+
+		DWORD pid = 0;
+		CHECK_HR(hr = pSessionControl2->GetProcessId(&pid));
+		pids.push_back(pid);
+	}
+done:
+	SAFE_RELEASE(pSessionControl2);
+	SAFE_RELEASE(pSessionControl);
+	SAFE_RELEASE(pSessionList);
+
+	return hr;
+}
+
+static HRESULT CreateSessionManager(IAudioSessionManager2 **ppSessionManager)
+{
+
+	HRESULT hr = S_OK;
+
+	IMMDevice *pDevice = NULL;
+	IMMDeviceEnumerator *pEnumerator = NULL;
+	IAudioSessionManager2 *pSessionManager = NULL;
+
+	// Create the device enumerator.
+	CHECK_HR(hr = CoCreateInstance(
+			 __uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+			 __uuidof(IMMDeviceEnumerator), (void **)&pEnumerator));
+
+	// Get the default audio device.
+	CHECK_HR(hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eMultimedia,
+							   &pDevice));
+
+	// Get the session manager.
+	CHECK_HR(hr = pDevice->Activate(__uuidof(IAudioSessionManager2),
+					CLSCTX_ALL, NULL,
+					(void **)&pSessionManager));
+
+	// Return the pointer to the caller.
+	*(ppSessionManager) = pSessionManager;
+	(*ppSessionManager)->AddRef();
+
+done:
+
+	// Clean up.
+	SAFE_RELEASE(pSessionManager);
+	SAFE_RELEASE(pEnumerator);
+	SAFE_RELEASE(pDevice);
+
+	return hr;
+}
+
+static DWORD this_pid = GetCurrentProcessId();
+static std::map<DWORD, std::vector<std::string>> get_processes_windows_map()
+{
+	std::map<DWORD, std::vector<std::string>> map;
+	EnumWindows(
+		[](HWND handle, LPARAM lParam) {
+			DWORD pid = 0;
+			GetWindowThreadProcessId(handle, &pid);
+			if (pid == this_pid)
+				return TRUE;
+
+			int len = GetWindowTextLength(handle);
+			if (!len || GetWindow(handle, GW_OWNER) != 0 ||
+			    !IsWindowVisible(handle))
+				return TRUE;
+
+			auto &map =
+				*(std::map<DWORD, std::vector<std::string>> *)
+					lParam;
+
+			std::vector<TCHAR> buffer;
+			buffer.resize(len);
+			GetWindowText(handle, buffer.data(), len);
+
+			dstr convert = {0};
+			dstr_from_wcs(&convert, buffer.data());
+
+			map[pid].emplace_back(convert.array);
+			dstr_free(&convert);
+
+			return TRUE;
+		},
+		(LPARAM)&map);
+	return std::move(map);
+}
+
+static std::map<DWORD, std::string> get_audio_processes_map()
+{
+	IAudioSessionManager2 *SessionManager = nullptr;
+	CreateSessionManager(&SessionManager);
+
+	std::vector<DWORD> pids;
+	EnumSessions(SessionManager, pids);
+	SessionManager->Release();
+
+	std::map<DWORD, std::string> map;
+	TCHAR path_buffer[MAX_PATH * 2] = {0};
+	for (DWORD pid : pids) {
+		HANDLE proc =
+			OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+				    FALSE, pid);
+		if (!proc)
+			continue;
+		if (!GetModuleFileNameEx(proc, NULL, path_buffer, MAX_PATH * 2)) {
+			CloseHandle(proc);
+			continue;
+		}
+		CloseHandle(proc);
+
+		dstr module_name = {0};
+		dstr_from_wcs(&module_name, PathFindFileName(path_buffer));
+		map[pid] = module_name.array;
+		dstr_free(&module_name);
+	}
+	return std::move(map);
+}
+
+static inline void encode_dstr(struct dstr *str)
+{
+	dstr_replace(str, "#", "#22");
+	dstr_replace(str, ":", "#3A");
+}
+
 
 //-----------------------------------------------------------------------------
 // Constructor and destructor of wasapi_capture class
@@ -40,9 +222,15 @@ wasapi_capture::wasapi_capture(obs_source_t* source)
 	process_id = 0;
 	target_process = INVALID_HANDLE_VALUE;
 
+	pipe = NULL;
+	shmem = NULL;
+	event_capture_start = NULL;
+	event_keepalive = NULL;
+
 	destroying_capture = false;
 	capture_thread = NULL;
 
+	event_destroy = CreateEventA(NULL, TRUE, FALSE, EVENT_DESTROY);
 	destroying = false;
 	keepalive_thread = CreateThread(nullptr, 0,
 		(LPTHREAD_START_ROUTINE)wasapi_capture::keepalive_thread_proc_proxy,
@@ -52,7 +240,9 @@ wasapi_capture::wasapi_capture(obs_source_t* source)
 wasapi_capture::~wasapi_capture()
 {
 	destroying = true;
+	SetEvent(event_destroy);
 	WaitForSingleObject(keepalive_thread, INFINITE);
+	CloseHandle(event_destroy);
 
 	std::scoped_lock<std::mutex> lock(update_capture_mutex);
 	exit_capture();
@@ -70,12 +260,12 @@ void wasapi_capture::keepalive_thread_proc_proxy(LPVOID param)
 
 void wasapi_capture::keepalive_thread_proc()
 {
-	while (!destroying)
-	{
-		SetEvent(event_keepalive);
-		Sleep(min(1000, KEEPALIVE_TIMEOUT / 2));
-
+	while (!destroying) {
 		update_capture();
+
+		if (event_keepalive)
+			SetEvent(event_keepalive);
+		WaitForSingleObject(event_destroy, std::min(1000, KEEPALIVE_TIMEOUT / 2));
 	}
 }
 
@@ -341,6 +531,9 @@ void wasapi_capture::inject()
 
 void wasapi_capture::eject()
 {
+	if (target_process == INVALID_HANDLE_VALUE)
+		return;
+
 	CloseHandle(target_process);
 	target_process = INVALID_HANDLE_VALUE;
 	SetEvent(event_exit);
@@ -368,6 +561,8 @@ void wasapi_capture::init_events()
 
 void wasapi_capture::free_events()
 {
+	if (event_capture_start == NULL)
+		return;
 	CloseHandle(event_capture_start);
 	CloseHandle(event_capture_stop);
 	CloseHandle(event_capture_restart);
@@ -375,6 +570,8 @@ void wasapi_capture::free_events()
 	CloseHandle(event_exit);
 	CloseHandle(event_packet_sent);
 	CloseHandle(event_keepalive);
+	event_capture_start = NULL;
+	event_keepalive = NULL;
 }
 
 void wasapi_capture::init_pipe()
@@ -394,6 +591,8 @@ void wasapi_capture::init_pipe()
 
 void wasapi_capture::free_pipe()
 {
+	if (pipe == NULL)
+		return;
 	CloseHandle(pipe);
 	pipe = NULL;
 }
@@ -413,6 +612,8 @@ void wasapi_capture::init_shared_memory()
 
 void wasapi_capture::free_shared_memory()
 {
+	if (shmem == NULL)
+		return;
 	UnmapViewOfFile(shared_data);
 	CloseHandle(shmem);
 	shared_data = nullptr;
@@ -478,6 +679,96 @@ void wasapi_capture::update_settings(obs_data_t* settings)
 
 DWORD wasapi_capture::get_target_process_id()
 {
+	auto process = obs_data_get_string(settings, setting_target_process);
+	if (process && process[0]) {
+		std::string title_str, exe_str;
+		DWORD pid = 0;
+		{
+			char *pid_str, *title_name, *exe_name;
+			build_window_strings(process, &pid_str, &title_name,
+					     &exe_name);
+			if (title_name) {
+				title_str = title_name;
+				bfree(title_name);
+			}
+			if (exe_name) {
+				exe_str = exe_name;
+				bfree(exe_name);
+			}
+			if (pid_str) {
+				pid = std::atoi(pid_str);
+				bfree(pid_str);
+			}
+		}
+
+		auto audio_processes = get_audio_processes_map();
+		auto processes_windows = get_processes_windows_map();
+
+		std::vector<DWORD> candidate_pids;
+		if (audio_processes.find(pid) != audio_processes.end() &&
+		    audio_processes[pid] == exe_str)
+			candidate_pids.push_back(pid);
+		else
+			for (auto &pair : audio_processes)
+				if (pair.second == exe_str)
+					candidate_pids.push_back(pair.first);
+		if (!candidate_pids.empty()) {
+			DWORD best_pid = 0;
+			int best_match = std::numeric_limits<int>::max();
+			std::string best_window;
+
+			for (DWORD candidate_pid : candidate_pids) {
+				if (processes_windows.find(candidate_pid) ==
+				    processes_windows.end()) {
+					int diff = title_str.length() + 1;
+					if (diff < best_match) {
+						best_match = diff;
+						best_pid = candidate_pid;
+						best_window = "";
+					}
+					continue;
+				}
+				for (auto &candidate_window :
+				     processes_windows[candidate_pid]) {
+					int diff = std::abs(title_str.compare(
+						candidate_window));
+					if (diff < best_match) {
+						best_match = diff;
+						best_pid = candidate_pid;
+						best_window = candidate_window;
+					}
+					if (best_match == 0)
+						break;
+				}
+				if (best_match == 0)
+					break;
+			}
+
+			dstr module_dstr = {0};
+			dstr_cat(&module_dstr, exe_str.c_str());
+			encode_dstr(&module_dstr);
+
+			dstr window_dstr = {0};
+			dstr_cat(&window_dstr, best_window.c_str());
+			encode_dstr(&window_dstr);
+
+			dstr new_value = {0};
+			dstr_printf(&new_value, "%s:%d:%s",
+				    window_dstr.array ? window_dstr.array : "",
+				    best_pid,
+				    module_dstr.array ? module_dstr.array : "");
+
+			obs_data_set_string(settings, setting_target_process,
+					    new_value.array);
+
+			dstr_free(&new_value);
+			dstr_free(&window_dstr);
+			dstr_free(&module_dstr);
+
+			return best_pid;
+		}
+	}
+
 	char* title;
 	char* class_name;
 	char* file_name;
@@ -487,9 +778,12 @@ DWORD wasapi_capture::get_target_process_id()
 	HWND hwnd = find_window(INCLUDE_MINIMIZED, WINDOW_PRIORITY_EXE, 
 		class_name, title, file_name);
 
+	bfree(file_name);
+	bfree(class_name);
+	bfree(title);
+
 	DWORD pid = 0;
 	GetWindowThreadProcessId(hwnd, &pid);
-
 	return pid;
 }
 
@@ -585,14 +879,53 @@ static void insert_preserved_val(obs_property_t *p, const char *val)
 	bfree(executable);
 }
 
-static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p,
-	obs_data_t *settings)
+static void fill_processes(obs_property_t *p)
+{
+	auto audio_processes = get_audio_processes_map();
+	auto processes_windows = get_processes_windows_map();
+	for (auto& pair : audio_processes) {
+		DWORD pid = pair.first;
+		std::string &exe_name = pair.second;
+
+		std::string window_name;
+		if (processes_windows.find(pid) != processes_windows.end() &&
+		    !processes_windows[pid].empty())
+			window_name = processes_windows[pid].front();
+
+		dstr desc = {0};
+		dstr_printf(&desc, "[%d: %s]: %s", pid, exe_name.c_str(),
+			    window_name.c_str());
+
+		dstr module_dstr = {0};
+		dstr_cat(&module_dstr, exe_name.c_str());
+		encode_dstr(&module_dstr);
+
+		dstr window_dstr = {0};
+		dstr_cat(&window_dstr, window_name.c_str());
+		encode_dstr(&window_dstr);
+
+		dstr value = {0};
+		dstr_printf(&value, "%s:%d:%s",
+			    window_dstr.array ? window_dstr.array : "", pid,
+			    module_dstr.array ? module_dstr.array : "");
+
+		obs_property_list_add_string(p, desc.array, value.array);
+
+		dstr_free(&desc);
+		dstr_free(&value);
+		dstr_free(&window_dstr);
+		dstr_free(&module_dstr);
+	}
+}
+
+static bool setting_changed(obs_properties_t *ppts, obs_property_t *p,
+				    obs_data_t *settings, const char* setting_name)
 {
 	const char *cur_val;
 	bool match = false;
 	size_t i = 0;
 
-	cur_val = obs_data_get_string(settings, setting_target_window);
+	cur_val = obs_data_get_string(settings, setting_name);
 	if (!cur_val) {
 		return false;
 	}
@@ -617,10 +950,29 @@ static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p,
 	return false;
 }
 
+static bool process_changed_callback(obs_properties_t *ppts, obs_property_t *p,
+				    obs_data_t *settings)
+{
+	return setting_changed(ppts, p, settings, setting_target_process);
+}
+
+static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p,
+				    obs_data_t *settings)
+{
+	return setting_changed(ppts, p, settings, setting_target_window);
+}
+
 obs_properties_t* wasapi_capture::get_properties(void* data)
 {
 	obs_properties_t* props = obs_properties_create();
 	obs_property_t *p;
+
+	p = obs_properties_add_list(props,
+		setting_target_process, setting_target_process_desc, 
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "", "");
+	fill_processes(p);
+	obs_property_set_modified_callback(p, process_changed_callback);
 
 	p = obs_properties_add_list(props,
 		setting_target_window, setting_target_window_desc, 

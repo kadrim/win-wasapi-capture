@@ -31,6 +31,7 @@ target_link_libraries(win-wasapi-capture
 	libobs
 	psapi
 	Dwmapi
+	Shlwapi
 )
 
 if(NOT is-standalone-build)

@@ -18,6 +18,7 @@
 #define EVENT_EXIT            "WASAPICaptureHook_Exit"
 #define EVENT_PACKET_SENT     "WASAPICaptureHook_PacketSent"
 #define EVENT_KEEPALIVE       "WASAPICaptureHook_KeepAlive"
+#define EVENT_DESTROY         "WASAPICaptureHook_Destroy"
 
 #define SHMEM_HOOK_INFO       "WASAPICaptureHook_HookInfo"
 #define STREAM_PIPE_NAME      "WASAPICaptureHook_StreamPipe"
