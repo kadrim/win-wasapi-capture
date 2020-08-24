@@ -327,25 +327,25 @@ bool wasapi_capture::receive_audio_packet()
 	DWORD bytes_read;
 	audio_packet_header header;
 	if (!ReadFile(pipe, &header, sizeof(header), &bytes_read, nullptr) ||
-		bytes_read != sizeof(header) ||
-		header.magic != AUDIO_PACKET_MAGIC)
-	{
+	    bytes_read != sizeof(header) ||
+	    header.magic != AUDIO_PACKET_MAGIC) {
 		return false; // failed reading header
 	}
 
 	// Extend buffer if required
 	if (capture_buflen < header.data_length) {
 		capture_buflen = header.data_length;
-		capture_buffer = (uint8_t*)realloc(capture_buffer, capture_buflen);
+		capture_buffer =
+			(uint8_t *)realloc(capture_buffer, capture_buflen);
 		if (!capture_buffer) {
 			destroying_capture = true;
 			return false; // out of memory
 		}
 	}
 
-	if (!ReadFile(pipe, capture_buffer, header.data_length, &bytes_read, nullptr) ||
-		bytes_read != header.data_length)
-	{
+	if (!ReadFile(pipe, capture_buffer, header.data_length, &bytes_read,
+		      nullptr) ||
+	    bytes_read != header.data_length) {
 		return false; // invalid data.
 	}
 
@@ -353,14 +353,30 @@ bool wasapi_capture::receive_audio_packet()
 		std::memset(capture_buffer, 0, header.data_length);
 
 	obs_source_audio audio = {0};
-	audio.format          = convert_audio_format(&header.wfext);
-	audio.frames          = header.frames;
+	audio.format = convert_audio_format(&header.wfext);
+	audio.frames = header.frames;
 	audio.samples_per_sec = header.wfext.Format.nSamplesPerSec;
-	audio.speakers        = convert_speaker_layout(&header.wfext);
-	audio.timestamp       = header.timestamp;
-	audio.data[0]         = capture_buffer;
+	audio.speakers = convert_speaker_layout(&header.wfext);
+	audio.timestamp = header.timestamp;
+	audio.data[0] = capture_buffer;
 
-	obs_source_output_audio(source, &audio);
+	if (header.wfext.Format.wBitsPerSample == 24 &&
+	    (header.wfext.Format.wFormatTag == WAVE_FORMAT_PCM ||
+	     (header.wfext.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+	      header.wfext.SubFormat == KSDATAFORMAT_SUBTYPE_PCM))) {
+		std::vector<uint32_t> convert_buffer;
+		convert_buffer.reserve(header.frames * header.wfext.Format.nChannels);
+		for (size_t i = 0;
+		     i < header.frames * header.wfext.Format.nChannels; ++i) {
+			convert_buffer.emplace_back(
+				*(uint32_t *)(capture_buffer + (i * 3)) << 8);
+		}
+		audio.format = AUDIO_FORMAT_32BIT;
+		audio.data[0] = (uint8_t*)convert_buffer.data();
+		obs_source_output_audio(source, &audio);
+	} else {
+		obs_source_output_audio(source, &audio);
+	}
 
 	return true;
 }
