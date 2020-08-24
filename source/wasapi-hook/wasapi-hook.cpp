@@ -10,10 +10,14 @@
 HMODULE this_module;
 
 typedef HRESULT (STDMETHODCALLTYPE *release_buffer_t)(
-	IAudioRenderClient*, UINT, DWORD);
+	IAudioRenderClient*, UINT32, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *get_buffer_t)(
+	IAudioRenderClient*, UINT32, BYTE**);
 
 static struct func_hook release_buffer;
-void* release_buffer_addr;
+static struct func_hook get_buffer;
+void *release_buffer_addr;
+void *get_buffer_addr;
 HANDLE pipe;
 HANDLE shmem;
 shmem_data* shared_data;
@@ -28,6 +32,11 @@ HANDLE event_packet_sent;
 HANDLE event_keepalive;
 
 CRITICAL_SECTION cs_release_buffer;
+CRITICAL_SECTION cs_get_buffer;
+
+size_t format_ptr_offset = 0;
+uint8_t *acquired_render_buffer = nullptr;
+DWORD32 acquired_frames = 0;
 
 static inline uint64_t get_clockfreq()
 {
@@ -55,30 +64,35 @@ static inline uint64_t os_gettime_ns()
 	return (uint64_t)time_val;
 }
 
+static HRESULT STDMETHODCALLTYPE hook_get_buffer(IAudioRenderClient *client,
+						     UINT32 NumFramesRequested,
+						     BYTE **ppData)
+{
+	EnterCriticalSection(&cs_get_buffer);
+
+	HRESULT hr;
+
+	// Call original
+	unhook(&get_buffer);
+	get_buffer_t call = (get_buffer_t)get_buffer.call_addr;
+	hr = call(client, NumFramesRequested, ppData);
+	rehook(&get_buffer);
+
+	acquired_render_buffer = (hr == S_OK) ? *ppData : nullptr;
+	acquired_frames = NumFramesRequested;
+
+	LeaveCriticalSection(&cs_get_buffer);
+
+	return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE hook_release_buffer(
 	IAudioRenderClient *client, UINT32 frames_written, DWORD flags)
 {
 	EnterCriticalSection(&cs_release_buffer);
 
 	HRESULT hr;
-	IAudioClient *aclient;
-	uint8_t *buffer;
-	WAVEFORMATEX *wfex;
-	WAVEFORMATEXTENSIBLE *wfext;
-	audio_packet_header packet_header;
-	size_t data_length;
-
-	// ****** This may be version specific ******
-#ifdef _WIN64
-	aclient = *(IAudioClient**)((uintptr_t)client + 0x10 * sizeof(void*));
-	buffer = *(uint8_t**)((uintptr_t)client + 0x16 * sizeof(void*));
-	wfex = *(WAVEFORMATEX**)((uintptr_t)client + 0x14 * sizeof(void*));
-#else
-	aclient = *(IAudioClient**)((uintptr_t)client + 0x12 * sizeof(void*));
-	buffer = *(uint8_t**)((uintptr_t)client + 0x1A * sizeof(void*));
-	wfex = *(WAVEFORMATEX**)((uintptr_t)client + 0x18 * sizeof(void*));
-#endif
-
+	WAVEFORMATEX *wfex = nullptr;
 
 	// get timestamp
 	static bool have_clockfreq = false;
@@ -96,26 +110,53 @@ static HRESULT STDMETHODCALLTYPE hook_release_buffer(
 	time_val *= 1000000000.0;
 	time_val /= (double)clock_freq.QuadPart;
 
+	if (acquired_render_buffer) {
+		if (!format_ptr_offset) {
+			for (size_t i = 0; i < 0x1000; ++i) {
+				try {
+					if (*(uint8_t **)(((uint8_t *)client) +
+							  i) ==
+					    acquired_render_buffer) {
+						format_ptr_offset =
+							i - sizeof(void *) * 2;
+						break;
+					}
+				} catch (...) {
+				}
+			}
+		}
 
-	// Write packet
-	wfext = (WAVEFORMATEXTENSIBLE*)wfex;
-	data_length = frames_written * wfex->nChannels * wfex->wBitsPerSample / 8;
+		if (format_ptr_offset)
+			wfex = *(WAVEFORMATEX **)(((uint8_t *)client) +
+						  format_ptr_offset);
+	}
 
-	packet_header.magic = AUDIO_PACKET_MAGIC;
-	packet_header.frames = frames_written;
-	packet_header.data_length = (uint32_t)data_length;
-	packet_header.timestamp = (uint64_t)time_val;
-	packet_header.silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-	memcpy(&packet_header.wfext, wfext, sizeof(WAVEFORMATEXTENSIBLE));
+	if (wfex && frames_written > 0 && frames_written == acquired_frames) {
+		WAVEFORMATEXTENSIBLE *wfext = (WAVEFORMATEXTENSIBLE *)wfex;
+		size_t data_length = frames_written * wfex->nChannels *
+				     wfex->wBitsPerSample / 8;
 
-	if (pipe != INVALID_HANDLE_VALUE)
-	{
-		DWORD written = 0;
-		WriteFile(pipe, &packet_header, sizeof(packet_header), &written, nullptr);
-		WriteFile(pipe, buffer, (DWORD)data_length, &written, nullptr);
+		// Write packet
+		audio_packet_header packet_header;
+		packet_header.magic = AUDIO_PACKET_MAGIC;
+		packet_header.frames = frames_written;
+		packet_header.data_length = (uint32_t)data_length;
+		packet_header.timestamp = (uint64_t)time_val;
+		packet_header.silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) !=
+				       0;
+		memcpy(&packet_header.wfext, wfext,
+		       sizeof(WAVEFORMATEXTENSIBLE));
 
-		os_atomic_inc_long(&shared_data->packets);
-		SetEvent(event_packet_sent);
+		if (pipe != INVALID_HANDLE_VALUE) {
+			DWORD written = 0;
+			WriteFile(pipe, &packet_header, sizeof(packet_header),
+				  &written, nullptr);
+			WriteFile(pipe, acquired_render_buffer,
+				  (DWORD)data_length, &written, nullptr);
+
+			os_atomic_inc_long(&shared_data->packets);
+			SetEvent(event_packet_sent);
+		}
 	}
 
 	// Call original
@@ -123,6 +164,9 @@ static HRESULT STDMETHODCALLTYPE hook_release_buffer(
 	release_buffer_t call = (release_buffer_t)release_buffer.call_addr;
 	hr = call(client, frames_written, flags);
 	rehook(&release_buffer);
+
+	acquired_render_buffer = nullptr;
+	acquired_frames = 0;
 
 	LeaveCriticalSection(&cs_release_buffer);
 
@@ -205,8 +249,8 @@ bool get_wasapi_offsets()
 		return false;
 	}
 
-	release_buffer_addr =
-		(void*)((*(uintptr_t**)render_client)[4]);
+	release_buffer_addr = (void *)((*(uintptr_t **)render_client)[4]);
+	get_buffer_addr = (void *)((*(uintptr_t **)render_client)[3]);
 
 	render_client->Release();
 	audio_client->Release();
@@ -222,6 +266,9 @@ void init_hook()
 		hook_release_buffer,
 		"IAudioRenderClient::ReleaseBuffer");
 	rehook(&release_buffer);
+	hook_init(&get_buffer, get_buffer_addr, hook_get_buffer,
+		  "IAudioRenderClient::GetBuffer");
+	rehook(&get_buffer);
 }
 
 void init_pipe()
@@ -306,6 +353,10 @@ void terminator_proc()
 	unhook(&release_buffer);
 	LeaveCriticalSection(&cs_release_buffer);
 
+	EnterCriticalSection(&cs_get_buffer);
+	unhook(&get_buffer);
+	LeaveCriticalSection(&cs_get_buffer);
+
 	Sleep(100); // make sure hook_release_buffer is complete
 
 	free_events();
@@ -326,6 +377,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason_for_call, LPVOID reserved)
 		get_wasapi_offsets();
 		CoUninitialize();
 
+		InitializeCriticalSection(&cs_get_buffer);
 		InitializeCriticalSection(&cs_release_buffer);
 
 		init_shared_memory();
