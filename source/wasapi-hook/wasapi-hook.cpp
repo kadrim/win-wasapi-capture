@@ -4,7 +4,7 @@
 #include <audioclient.h>
 #include <mmdeviceapi.h>
 #include <util/threading.h>
-#include "../../../win-capture/funchook.h"
+#include "funchook.h"
 #include "../wasapi-hook-info.h"
 
 HMODULE this_module;

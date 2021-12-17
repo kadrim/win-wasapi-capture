@@ -7,12 +7,12 @@ include_directories(
 set(wasapi-hook_HEADERS
     ../../../win-capture/obfuscate.h
     ../../../win-capture/hook-helpers.h
-    ../../../win-capture/funchook.h
+    funchook.h
 	../wasapi-hook-info.h)
 
 set(wasapi-hook_SOURCES
     ../../../win-capture/obfuscate.c
-    ../../../win-capture/funchook.c
+    funchook.c
     wasapi-hook.cpp)
 
 add_library(wasapi-hook MODULE
